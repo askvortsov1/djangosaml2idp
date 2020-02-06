@@ -1,0 +1,4 @@
+[
+  "tests/test_error_views.py::TestErrorView::test_uses_correct_template",
+  "tests/test_urls.py::test_init_url"
+]

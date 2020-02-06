@@ -2,9 +2,9 @@ import datetime
 import json
 import logging
 import os
+import pytz
 from typing import Dict
 
-import pytz
 from django.conf import settings
 from django.db import models
 from django.utils.functional import cached_property
@@ -120,9 +120,13 @@ class ServiceProvider(models.Model):
                 logger.error(f'Could not create temporary folder to store metadata at {path}: {e}')
                 raise
         filename = f'{path}/{self.id}.xml'
+<<<<<<< HEAD
 
         # Rewrite the file if it did not exist yet, or if the SP config was updated after having written the file previously.
         if not os.path.exists(filename) or refreshed_metadata or self.dt_updated > datetime.datetime.fromtimestamp(os.path.getmtime(filename)).replace(tzinfo=pytz.utc):
+=======
+        if not os.path.exists(filename) or self.dt_updated > datetime.datetime.fromtimestamp(os.path.getmtime(filename)).replace(tzinfo=pytz.utc):
+>>>>>>> 97119bc278eddc3e78cd5a7ee469f918a1a6034f
             try:
                 with open(filename, 'w') as f:
                     f.write(self.local_metadata)
