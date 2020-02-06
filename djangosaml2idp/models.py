@@ -1,14 +1,19 @@
+import datetime
 import json
 import logging
+import os
 from typing import Dict
-import datetime
+
+import pytz
 from django.conf import settings
 from django.db import models
-from django.utils.safestring import mark_safe
-from saml2 import xmldsig
 from django.utils.functional import cached_property
-import os
+from django.utils.safestring import mark_safe
+from django.utils.timezone import now
+from saml2 import xmldsig
+
 from .idp import IDP
+from .utils import fetch_metadata, validate_metadata, extract_validuntil_from_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +36,22 @@ class ServiceProvider(models.Model):
     entity_id = models.CharField(verbose_name='Entity ID', max_length=256, unique=True)
     pretty_name = models.CharField(verbose_name='Pretty Name', blank=True, max_length=256, help_text='For display purposes, can be empty')
     description = models.TextField(verbose_name='Description', blank=True)
-    metadata = models.TextField(verbose_name='Metadata XML', blank=True, help_text='XML containing the metadata')
+
+    # Metadata
+    metadata_expiration_dt = models.DateTimeField(verbose_name='Metadata valid until')
+    remote_metadata_url = models.CharField(verbose_name='Remote metadata URL', max_length=512, blank=True, help_text='If set, metadata will be fetched upon saving into the local metadata xml field, and automatically be refreshed after the expiration timestamp.')
+    local_metadata = models.TextField(verbose_name='Local Metadata XML', blank=True, help_text='XML containing the metadata')
+
+    def refresh_metadata(self, force_refresh: bool = False) -> bool:
+        ''' If a remote metadata url is set, fetch new metadata if the locally cached one is expired. Returns True if new metadata was set.
+            Sets metadata fields on instance, but does not save to db. If force_refresh = True, the metadata will be refreshed regardless of the currently cached version validity timestamp.
+        '''
+        if not self.local_metadata or now() > self.metadata_expiration_dt or force_refresh:
+            if self.remote_metadata_url:
+                self.local_metadata = validate_metadata(fetch_metadata(self.remote_metadata_url))
+            self.metadata_expiration_dt = extract_validuntil_from_metadata(self.local_metadata)
+            return True
+        return False
 
     # Configuration
     active = models.BooleanField(verbose_name='Active', default=True)
@@ -87,6 +107,11 @@ class ServiceProvider(models.Model):
         """ Write the metadata content to a local file, so it can be used as 'local'-type metadata for pysaml2.
             Return the location of that file.
         """
+        # On access, update the metadata if necessary
+        refreshed_metadata = self.refresh_metadata()
+        if refreshed_metadata:
+            self.save()
+
         path = '/tmp/djangosaml2idp'
         if not os.path.exists(path):
             try:
@@ -95,10 +120,12 @@ class ServiceProvider(models.Model):
                 logger.error(f'Could not create temporary folder to store metadata at {path}: {e}')
                 raise
         filename = f'{path}/{self.id}.xml'
-        if not os.path.exists(filename) or self.dt_updated > datetime.datetime.fromtimestamp(os.path.getmtime(filename)):
+
+        # Rewrite the file if it did not exist yet, or if the SP config was updated after having written the file previously.
+        if not os.path.exists(filename) or refreshed_metadata or self.dt_updated > datetime.datetime.fromtimestamp(os.path.getmtime(filename)).replace(tzinfo=pytz.utc):
             try:
                 with open(filename, 'w') as f:
-                    f.write(self.metadata)
+                    f.write(self.local_metadata)
             except Exception as e:
                 logger.error(f'Could not write metadata to file {filename}: {e}')
                 raise
@@ -125,29 +152,32 @@ class ServiceProvider(models.Model):
     @property
     def signing_algorithm(self) -> str:
         if self._signing_algorithm is None:
-            return settings.SAML_AUTHN_SIGN_ALG
+            return getattr(settings, "SAML_AUTHN_SIGN_ALG", xmldsig.SIG_RSA_SHA256)
         return self._signing_algorithm
 
     @property
     def digest_algorithm(self) -> str:
         if self._digest_algorithm is None:
-            return settings.SAML_AUTHN_DIGEST_ALG
+            return getattr(settings, "SAML_AUTHN_DIGEST_ALG", xmldsig.DIGEST_SHA256)
         return self._digest_algorithm
 
     @property
     def resulting_config(self) -> str:
         """ Actual values of the config / properties with the settings and defaults taken into account.
         """
-        d = {
-            'entity_id': self.entity_id,
-            'attribute_mapping': self.attribute_mapping,
-            'nameid_field': self.nameid_field,
-            'sign_response': self.sign_response,
-            'sign_assertion': self.sign_assertion,
-            'encrypt_saml_responses': self.encrypt_saml_responses,
-            'signing_algorithm': self.signing_algorithm,
-            'digest_algorithm': self.digest_algorithm,
-        }
-        config_as_str = json.dumps(d, indent=4)
+        try:
+            d = {
+                'entity_id': self.entity_id,
+                'attribute_mapping': self.attribute_mapping,
+                'nameid_field': self.nameid_field,
+                'sign_response': self.sign_response,
+                'sign_assertion': self.sign_assertion,
+                'encrypt_saml_responses': self.encrypt_saml_responses,
+                'signing_algorithm': self.signing_algorithm,
+                'digest_algorithm': self.digest_algorithm,
+            }
+            config_as_str = json.dumps(d, indent=4)
+        except Exception as e:
+            config_as_str = f'Could not render config: {e}'
         # Some ugly replacements to have the json decently printed in the admin
         return mark_safe(config_as_str.replace("\n", "<br>").replace("    ", "&nbsp;&nbsp;&nbsp;&nbsp;"))
